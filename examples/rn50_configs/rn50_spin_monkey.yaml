@@ -1,0 +1,47 @@
+data:
+  train_dataset: "/gpfs/radev/scratch/yildirim/hy348/datasets/SPIN_datasets/train-monkey.beton"
+  val_dataset:  "/gpfs/radev/scratch/yildirim/hy348/datasets/SPIN_datasets/val-monkey.beton"
+  in_memory: 1
+  num_workers: 12
+  num_classes: 64
+dist:
+  use_submitit: 0
+  world_size: 1
+  ngpus: 1
+  nodes: 1
+  partition: gpu
+  timeout: 1440
+  constraint: "a100"
+  mail_type: "ALL"
+logging:
+  folder: "./logs"
+  new_folder: "./logs-monkey"
+simclr:
+  temperature: 0.25
+lr:
+  lr: 1.7
+  lr_schedule_type: cyclic
+model:
+  arch: resnet50
+  mlp: "2048-512"
+  mlp_bias: 1
+training:
+  batch_size: 512
+  bn_wd: 0
+  distributed: 1
+  epochs: 100
+  label_smoothing: 0
+  momentum: 0.9
+  optimizer: "adamw"
+  weight_decay: 0.0001
+  use_blurpool: 0
+  loss: "simclr"
+  base_lr: 0.0005
+validation:
+  lr_tta: False
+  resolution: 256
+resolution:
+  end_ramp: 85
+  max_res: 224
+  min_res: 160
+  start_ramp: 10

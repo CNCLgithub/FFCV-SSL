@@ -30,6 +30,7 @@ from uuid import uuid4
 from typing import List
 from pathlib import Path
 from argparse import ArgumentParser
+from collections import OrderedDict
 
 from fastargs import get_current_config, set_current_config
 from fastargs.decorators import param
@@ -49,9 +50,11 @@ Section('model', 'model details').params(
     remove_head=Param(int, 'remove the projector? (1/0)', default=0),
     mlp=Param(str, 'number of projector layers', default="2048-512"),
     mlp_coeff=Param(float, 'number of projector layers', default=1),
+    mlp_bias=Param(bool, 'Whether to use a bias term in the MLP', default=False),
     patch_keep=Param(float, 'Proportion of patches to keep with VIT training', default=1.0),
     fc=Param(int, 'remove the projector? (1/0)', default=0),
     proj_relu=Param(int, 'Proj relu? (1/0)', default=0),
+    ief_iters=Param(int, 'number of iterations for iterative error feedback (IEF)', default=0)
 )
 
 Section('resolution', 'resolution scheduling').params(
@@ -66,6 +69,7 @@ Section('data', 'data related stuff').params(
     val_dataset=Param(str, '.dat file to use for validation', default=""),
     num_workers=Param(int, 'The number of workers', default=10),
     in_memory=Param(int, 'does the dataset fit in memory? (1/0)', required=True),
+    num_classes=Param(int, 'number of classes in the dataset', required=True)
 )
 
 Section('vicreg', 'Vicreg').params(
@@ -87,7 +91,8 @@ Section('byol', 'byol').params(
 )
 
 Section('logging', 'how to log stuff').params(
-    folder=Param(str, 'log location', required=True),
+    folder=Param(str, 'log location (load from here if checkpoint exists)', required=True),
+    new_folder=Param(str, 'log location (save here if checkpoint exists)', default=None),
     log_level=Param(int, '0 if only at end 1 otherwise', default=2),
     checkpoint_freq=Param(int, 'When saving checkpoints', default=5)
 )
@@ -125,7 +130,9 @@ Section('dist', 'distributed training options').params(
     timeout=Param(int, 'timeout', default=2800),
     partition=Param(str, 'partition', default="learnlab"),
     address=Param(str, 'address', default='localhost'),
-    port=Param(str, 'port', default='58492')
+    port=Param(str, 'port', default='58492'),
+    constraint=Param(str, 'constraint for slurm', default=None),
+    mail_type=Param(str, 'mail type for slurm', default=None),
 )
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255
@@ -138,9 +145,9 @@ DEFAULT_CROP_RATIO = 224/256
 
 def get_shared_folder() -> Path:
     user = os.getenv("USER")
-    path = "/checkpoint/"
+    path = "/gpfs/radev/project/yildirim/hy348/dev/FFCV-SSL/checkpoint"
     if Path(path).is_dir():
-        p = Path(f"{path}{user}/experiments")
+        p = Path(f"{path}/experiments")
         p.mkdir(exist_ok=True)
         return p
     raise RuntimeError("No shared folder available")
@@ -169,6 +176,19 @@ def gather_center(x):
 def batch_all_gather(x):
     x_list = GatherLayer.apply(x.contiguous())
     return ch.cat(x_list, dim=0)
+
+class SaveOutput:
+    # stores the hooked layers
+    # Source 1: https://towardsdatascience.com/the-one-pytorch-trick-which-you-should-know-2d5e9c1da2ca
+    # Source 2: https://discuss.pytorch.org/t/extracting-stats-from-activated-layers-training/45880/2
+    def __init__(self):
+        self.outputs = OrderedDict()
+
+    def save_activation(self, name):
+        def hook(module, module_in, module_out):
+            self.outputs.update({name: module_out})
+
+        return hook
 
 class GatherLayer(ch.autograd.Function):
     """
@@ -357,13 +377,39 @@ class SSLNetwork(nn.Module):
         self, arch, remove_head, mlp, patch_keep, fc, loss
     ):
         super().__init__()
+        self.save_output = SaveOutput()
         if "resnet" in arch:
             import torchvision.models.resnet as resnet
+            self.hook_map = OrderedDict([("B1U1", ["layer1", 0]),
+                                        ("B1U2", ["layer1", 1]),
+                                        ("B1U3", ["layer1", 2]),
+                                        ("B2U1", ["layer2", 0]),
+                                        ("B2U2", ["layer2", 1]),
+                                        ("B2U3", ["layer2", 2]),
+                                        ("B2U4", ["layer2", 3]),
+                                        ("B3U1", ["layer3", 0]),
+                                        ("B3U2", ["layer3", 1]),
+                                        ("B3U3", ["layer3", 2]),
+                                        ("B3U4", ["layer3", 3]),
+                                        ("B3U5", ["layer3", 4]),
+                                        ("B3U6", ["layer3", 5]),
+                                        ("B4U1", ["layer4", 0]),
+                                        ("B4U2", ["layer4", 1]),
+                                        ("TCL", ["layer4", 2]),
+                                        ("POOL", ["avgpool"]),
+                                        ])
             self.net = resnet.__dict__[arch]()
             if fc:
                 self.net.fc = nn.Linear(2048, 256)
+                self.hook_map["FC0"] = ["fc"]
             else:
                 self.net.fc = nn.Identity()
+            for region, hook_loc in self.hook_map.items():
+                layer = getattr(self.net, hook_loc[0])
+                if len(hook_loc) == 2:
+                    layer = layer[hook_loc[1]]
+                layer.register_forward_hook(self.save_output.save_activation(region))
+
         elif "vgg" in arch:
             import torchvision.models.vgg as vgg
             self.net = vgg.__dict__[arch]()
@@ -383,6 +429,12 @@ class SSLNetwork(nn.Module):
         else:
             self.num_features = int(self.mlp.split("-")[-1])
             self.projector = self.MLP(self.representation_size)
+
+        # TODO remove this?
+        # save layer outputs
+        for i, layer in enumerate(self.projector.children()):
+            layer.register_forward_hook(self.save_output.save_activation(f"FC{i+1}"))
+
         self.loss = loss
         if loss == "barlow":
             self.bn = nn.BatchNorm1d(self.num_features, affine=False)
@@ -391,38 +443,67 @@ class SSLNetwork(nn.Module):
 
     @param('model.proj_relu')
     @param('model.mlp_coeff')
-    def MLP(self, size, proj_relu, mlp_coeff):
+    @param('model.mlp_bias')
+    @param('model.ief_iters')
+    def MLP(self, size, proj_relu, mlp_coeff, mlp_bias, ief_iters):
         mlp_spec = f"{size}-{self.mlp}"
         layers = []
         f = list(map(int, mlp_spec.split("-")))
         f[-2] = int(f[-2] * mlp_coeff)
+
+        if ief_iters > 0:
+            # the output of the last layer will be concatenated with
+            # the input into the first
+            f[0] = f[0] + f[-1]
+            # to initialize IEF loop
+            self.register_buffer('init_vec', ch.zeros((1, f[-1])))
+
         print("MLP:", f)
         for i in range(len(f) - 2):
             layers.append(nn.Sequential(nn.Linear(f[i], f[i + 1]), nn.BatchNorm1d(f[i + 1]), nn.ReLU(True)))
         if proj_relu:
-            layers.append(nn.Sequential(nn.Linear(f[-2], f[-1], bias=False), nn.ReLU(True)))
+            layers.append(nn.Sequential(nn.Linear(f[-2], f[-1], bias=mlp_bias), nn.ReLU(True)))
         else:
-            layers.append(nn.Linear(f[-2], f[-1], bias=False))
+            layers.append(nn.Linear(f[-2], f[-1], bias=mlp_bias))
+
         return nn.Sequential(*layers)
 
-    def forward(self, inputs, embedding=False, predictor=False):
+    @param('model.ief_iters')
+    def forward(self, inputs, ief_iters, embedding=False, predictor=False):
         if embedding:
             embedding = self.net(inputs)
             return embedding
         else:
+            features = self.save_output.outputs
             representation = self.net(inputs)
-            embeddings = self.projector(representation)
             list_outputs = [representation.detach()]
-            outputs_train = representation.detach()
-            for l in range(len(self.projector)):
-                outputs_train = self.projector[l](outputs_train).detach()
-                list_outputs.append(outputs_train)
-            if self.loss == "byol" and predictor:         
+            if ief_iters > 0:
+                init_vec = self.init_vec.expand(inputs.shape[0], -1)
+                embeddings = init_vec
+                for i in range(ief_iters):
+                    xc = ch.cat([representation, embeddings], 1)
+                    for j in range(len(self.projector)):
+                        xc = self.projector[j](xc)
+                        features[f"FC{j+1}_{i}"] = features[f"FC{j+1}"] = features[f"OUTVEC_{i}"] = xc.detach()
+                    embeddings = embeddings + xc
+                    features[f"PREDVEC_{i}"] =  embeddings.detach()
+            else:
+                embeddings = representation
+                for j in range(len(self.projector)):
+                    embeddings = self.projector[j](embeddings)
+                    features["PREDVEC"] = features[f"FC{j+1}"] = embeddings.detach()
+
+            for j in range(len(self.projector)):
+                list_outputs.append(features[f"FC{j+1}"])
+
+            if self.loss == "byol" and predictor:
                 embeddings = self.predictor(embeddings)
+
             return embeddings, list_outputs
 
 class LinearsProbes(nn.Module):
     @param('model.mlp_coeff')
+    @param('data.num_classes')
     def __init__(self, model, num_classes, mlp_coeff):
         super().__init__()
         print("NUM CLASSES", num_classes)
@@ -451,7 +532,10 @@ class ImageNetTrainer:
     @param('training.epochs')
     @param('data.train_dataset')
     @param('data.val_dataset')
-    def __init__(self, gpu, ngpus_per_node, world_size, dist_url, distributed, batch_size, label_smoothing, loss, train_probes_only, epochs, train_dataset, val_dataset):
+    @param('data.num_classes')
+    @param('logging.folder')
+    @param('logging.new_folder')
+    def __init__(self, gpu, ngpus_per_node, world_size, dist_url, distributed, batch_size, label_smoothing, loss, train_probes_only, epochs, train_dataset, val_dataset, num_classes, folder, new_folder):
         self.all_params = get_current_config()
         ch.cuda.set_device(gpu)
         self.gpu = gpu
@@ -469,26 +553,30 @@ class ImageNetTrainer:
         self.index_labels = 1
         self.train_loader = self.create_train_loader_ssl(train_dataset)
         self.num_train_exemples = self.train_loader.indices.shape[0]
-        self.num_classes = 1000
         self.val_loader = self.create_val_loader(val_dataset)
-        print("NUM TRAINING EXEMPLES:", self.num_train_exemples)
+        print("NUM TRAINING EXAMPLES:", self.num_train_exemples)
         # Create SSL model
         self.model, self.scaler = self.create_model_and_scaler()
+        print("Model:", self.model)
         self.num_features = self.model.module.num_features
         self.n_layers_proj = len(self.model.module.projector) + 1
         print("N layers in proj:", self.n_layers_proj)
-        self.initialize_logger()
         self.classif_loss = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         self.create_optimizer()
         # Create lineares probes
+        self.num_classes = num_classes
         self.loss = nn.CrossEntropyLoss()
-        self.probes = LinearsProbes(self.model, num_classes=self.num_classes)
+        self.probes = LinearsProbes(self.model)
         self.probes = self.probes.to(memory_format=ch.channels_last)
         self.probes = self.probes.to(self.gpu)
         self.probes = ch.nn.parallel.DistributedDataParallel(self.probes, device_ids=[self.gpu])
         self.optimizer_probes = ch.optim.AdamW(self.probes.parameters(), lr=1e-4)
         # Load models if checkpoints
+        self.log_folder = Path(folder)
         self.load_checkpoint()
+        # Initialize logger with a new folder if given
+        folder = folder if new_folder is None else new_folder
+        self.initialize_logger(folder)
         # Define SSL loss
         self.do_ssl_training = False if train_probes_only else True
         self.teacher_student = False
@@ -727,15 +815,22 @@ class ImageNetTrainer:
         return model, scaler
 
     @param('training.train_probes_only')
-    def load_checkpoint(self, train_probes_only):
+    @param('data.num_classes')
+    @param('logging.folder')
+    @param('logging.new_folder')
+    def load_checkpoint(self, train_probes_only, num_classes, folder, new_folder):
         if (self.log_folder / "model.pth").is_file():
             if self.rank == 0:
                 print("resuming from checkpoint")
             ckpt = ch.load(self.log_folder / "model.pth", map_location="cpu")
             self.start_epoch = ckpt["epoch"]
             self.model.load_state_dict(ckpt["model"])
-            self.optimizer.load_state_dict(ckpt["optimizer"])
-            if not train_probes_only:
+            if folder == new_folder:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            else:
+                self.start_epoch = 0
+            probes_n_classes = len(list(ckpt['probes'].values())[-1])
+            if not train_probes_only and probes_n_classes == num_classes:
                 self.probes.load_state_dict(ckpt["probes"])
                 self.optimizer_probes.load_state_dict(ckpt["optimizer_probes"])
             else:
@@ -909,7 +1004,6 @@ class ImageNetTrainer:
         [meter.reset() for meter in self.val_meters.values()]
         return stats
 
-    @param('logging.folder')
     def initialize_logger(self, folder):
         self.train_meters = {
             'loss': torchmetrics.MeanMetric(compute_on_step=False).to(self.gpu),
@@ -975,7 +1069,7 @@ class ImageNetTrainer:
                 dist_url = "tcp://localhost:"+port
             ch.multiprocessing.spawn(cls._exec_wrapper, nprocs=ngpus_per_node, join=True, args=(None, ngpus_per_node, world_size, dist_url))
         else:
-            cls.exec(0)
+            cls.exec(0, make_config(quiet=True), 1, 1, "tcp://localhost:"+port)
 
     @classmethod
     def _exec_wrapper(cls, *args, **kwargs):
@@ -1044,11 +1138,14 @@ def make_config(quiet=False):
 @param('logging.folder')
 @param('dist.ngpus')
 @param('dist.nodes')
+@param('data.num_workers')
+@param('dist.constraint')
+@param('dist.mail_type')
 @param('dist.timeout')
 @param('dist.partition')
 @param('dist.comment')
 @param('dist.port')
-def run_submitit(config, folder, ngpus, nodes,  timeout, partition, comment, port):
+def run_submitit(config, folder, ngpus, nodes, num_workers, constraint, mail_type, timeout, partition, comment, port):
     Path(folder).mkdir(parents=True, exist_ok=True)
     executor = submitit.AutoExecutor(folder=folder, slurm_max_num_timeout=30)
 
@@ -1063,11 +1160,13 @@ def run_submitit(config, folder, ngpus, nodes,  timeout, partition, comment, por
         mem_gb=60 * num_gpus_per_node,
         gpus_per_node=num_gpus_per_node,
         tasks_per_node=num_gpus_per_node, 
-        cpus_per_task=10,
+        cpus_per_task=num_workers,
         nodes=nodes,
         timeout_min=timeout_min,
         slurm_partition=partition,
         slurm_signal_delay_s=120,
+        slurm_constraint=constraint,
+        slurm_mail_type=mail_type,
         **kwargs
     )
 
